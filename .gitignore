@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Large data & model files
+data/
+checkpoints/
+*.pt
+*.pth
+*.pkl
+*.npz
+*.npy
+*.h5
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Zip packages
+master_implementation.zip
