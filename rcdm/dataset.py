@@ -20,7 +20,7 @@ class RepresentationDataset(Dataset):
     Returns (x, h) where:
         x : image tensor (3, image_size, image_size), normalised to [-1, 1]
             — this is what the diffusion model expects
-        h : representation tensor (2048,)
+        h : representation tensor (384,) — DinoV3 ViT-S/16 CLS token
             — this is the conditioning vector
 
     Note on normalisation:
@@ -30,17 +30,17 @@ class RepresentationDataset(Dataset):
         x uses the diffusion normalisation, h was computed with encoder normalisation.
     """
 
-    def __init__(self, reps_file, image_size=64):
+    def __init__(self, reps_file, image_size=224):
         """
         Args:
             reps_file  : path to the .pt file from precompute_reps.py
-            image_size : spatial size to resize images to
+            image_size : spatial size to resize images to (224 for Messidor-2)
         """
         print(f"Loading representations from {reps_file}...")
         data = torch.load(reps_file)
 
         self.paths = data["paths"]   # list[str], length N
-        self.reps  = data["reps"]    # Tensor (N, 2048)
+        self.reps  = data["reps"]    # Tensor (N, 384) — DinoV3 ViT-S/16 CLS tokens
 
         print(f"  {len(self.paths)} image-representation pairs loaded")
 
@@ -63,6 +63,6 @@ class RepresentationDataset(Dataset):
         x = self.transform(img)        # (3, image_size, image_size)
 
         # Load precomputed representation — already a tensor
-        h = self.reps[idx]             # (2048,)
+        h = self.reps[idx]             # (384,) DinoV3 CLS token
 
         return x, h

@@ -1,27 +1,32 @@
 """
 precompute_reps.py
 
-Run the frozen SSL encoder over every training image in Tiny ImageNet
-and save the representations to disk.
+Run the frozen DinoV3 ViT-S/16 encoder over every training image and save
+the CLS-token representations to disk.
+
+What changed from the original RCDM:
+  - Encoder   : ResNet-50 (2048-dim avgpool) → DinoV3 ViT-S/16 (384-dim CLS token)
+  - image_size: 64 (Tiny ImageNet) → 224 (Messidor-2 canonical)
+  - data_dir  : data/tiny-imagenet-200/train → data/messidor2/train
+  - Rep shape : (N, 2048) → (N, 384)
 
 Usage:
-    python scripts/precompute_reps.py \
-        --data_dir  data/tiny-imagenet-200/train \
-        --out_file  data/tiny-imagenet-200/train_reps.pt \
-        --image_size 64 \
-        --batch_size 128 \
+    python scripts/precompute_reps.py \\
+        --data_dir  data/messidor2/train \\
+        --out_file  data/messidor2/train_reps.pt \\
+        --image_size 224 \\
+        --batch_size 64 \\
         --device cpu
 
 Output:
     A .pt file containing a dict:
     {
-        "paths" : list of str         — relative image paths, length N
-        "reps"  : torch.Tensor        — shape (N, 2048), float32
+        "paths" : list of str         — image paths, length N
+        "reps"  : torch.Tensor        — shape (N, 384), float32
     }
 
-    The index alignment is exact:
-        reps[i]  is the representation of  paths[i]
-    This pairing is what the training dataloader uses.
+    Index alignment is exact:  reps[i] is the representation of paths[i].
+    This pairing is what RepresentationDataset uses during training.
 """
 
 import argparse
@@ -41,16 +46,11 @@ def collect_image_paths(data_dir):
     """
     Walk the training directory and collect every image path.
 
-    Tiny ImageNet training structure:
+    Messidor-2 training structure (flat or nested — any layout works):
         train/
-            n01443537/
-                images/
-                    n01443537_0.JPEG
-                    n01443537_1.JPEG
-                    ...
-            n01629819/
-                images/
-                    ...
+            img001.jpg
+            img002.png
+            ...
 
     Returns a sorted list of absolute path strings.
     We sort so the order is deterministic across runs.
@@ -72,20 +72,20 @@ def main():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data/tiny-imagenet-200/train",
-        help="Root of the Tiny ImageNet training split",
+        default="data/messidor2/train",
+        help="Root of the Messidor-2 training split",
     )
     parser.add_argument(
         "--out_file",
         type=str,
-        default="data/tiny-imagenet-200/train_reps.pt",
+        default="data/messidor2/train_reps.pt",
         help="Where to save the output .pt file",
     )
     parser.add_argument(
         "--image_size",
         type=int,
-        default=64,
-        help="Resize images to this before encoding (match RCDM training size)",
+        default=224,
+        help="Resize images before encoding (224 = DinoV3 ViT-S/16 canonical size)",
     )
     parser.add_argument(
         "--batch_size",
@@ -110,7 +110,7 @@ def main():
     if len(paths) == 0:
         raise RuntimeError(
             f"No images found in {args.data_dir}. "
-            "Check that the path points to the Tiny ImageNet train/ folder."
+            "Check that the path points to the Messidor-2 train/ folder."
         )
 
     # ------------------------------------------------------------------ #
@@ -118,7 +118,9 @@ def main():
     # ------------------------------------------------------------------ #
     print(f"\n[2/3] Loading encoder on {args.device}...")
     encoder  = load_encoder(device=args.device)
-    transform = build_transform(image_size=args.image_size)
+    # ── JiT-RCDM: always 224 for DinoV3 ViT-S/16 — fixed pos-embed grid (224/16=14×14) ──
+    # args.image_size controls the generative model resolution, not the encoder.
+    transform = build_transform(image_size=224)
 
     print(f"Running encoder over {len(paths)} images "
           f"(batch_size={args.batch_size})...")
@@ -131,7 +133,7 @@ def main():
         batch_size=args.batch_size,
     )
 
-    # reps shape: (N, 2048)
+    # reps shape: (N, 384) — DinoV3 ViT-S/16 CLS token
     print(f"\nRepresentations shape : {reps.shape}")
     print(f"Representations dtype : {reps.dtype}")
     print(f"Sample norm (first 5) : {reps[:5].norm(dim=1).tolist()}")
@@ -145,7 +147,7 @@ def main():
     torch.save(
         {
             "paths": paths,   # list[str], length N
-            "reps":  reps,    # Tensor (N, 2048)
+            "reps":  reps,    # Tensor (N, 384)
         },
         args.out_file,
     )
@@ -154,8 +156,8 @@ def main():
     loaded = torch.load(args.out_file)
     assert len(loaded["paths"]) == loaded["reps"].shape[0], \
         "Path count and rep count don't match — something went wrong"
-    assert loaded["reps"].shape[1] == 2048, \
-        f"Expected 2048-dim reps, got {loaded['reps'].shape[1]}"
+    assert loaded["reps"].shape[1] == 384, \
+        f"Expected 384-dim DinoV3 ViT-S reps, got {loaded['reps'].shape[1]}"
 
     print(f"\nDone. Saved {len(paths)} representations to {args.out_file}")
     print(f"File size: {Path(args.out_file).stat().st_size / 1e6:.1f} MB")

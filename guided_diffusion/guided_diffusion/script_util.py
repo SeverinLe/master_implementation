@@ -61,7 +61,7 @@ def model_and_diffusion_defaults():
         resblock_updown=False,
         use_fp16=False,
         use_new_attention_order=False,
-        h_dim=2048, # new: number of dimensions in the raw SSL representation
+        h_dim=1024, # DinoV2-L CLS token dimension (was 2048 for ResNet-50)
     )
     res.update(diffusion_defaults())
     return res

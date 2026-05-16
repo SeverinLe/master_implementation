@@ -1,39 +1,49 @@
+import os
 import torch
-import torch.nn as nn
-from torchvision import models, transforms
+from torchvision import transforms
+from transformers import AutoModel
 from PIL import Image
 
+# Path to the local DinoV3 checkpoint directory.
+# Expected contents: config.json + model.safetensors (HuggingFace format).
+# ViT-S/16 architecture → hidden_dim=384 → CLS token is 384-dim.
+DINOV3_CHECKPOINT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "checkpoints", "dinov3_vits16_tmp",
+)
 
-def load_encoder(device="cpu"):
+# CLS-token dimension for DinoV3 ViT-S/16
+ENCODER_OUTPUT_DIM = 384
+
+
+def load_encoder(device="cpu", checkpoint_path=DINOV3_CHECKPOINT):
     """
-    Load a pretrained ResNet-50 backbone. 
+    Load DinoV3 ViT-S/16 from a local checkpoint as the frozen SSL encoder.
 
-    VISSL is a large framework built for distributed training clusters and its model zoo requires specific config 
-    files to load. For Tiny ImageNet at demonstration scale, we use torchvision directly, which gives us the same 
-    ResNet-50 backbone with pretrained ImageNet weights in three lines. The representations it produces are identical
-    in structure to what VISSL would give — when you move to full ImageNet scale later, swapping in a VISSL checkpoint 
-    is one function call.
+    Why DinoV3 over DinoV2-L:
+      - DinoV3 ViT-S/16 is a custom-trained DINO-family SSL model fine-tuned
+        for retinal / medical imaging, making its representations more domain-
+        appropriate for Messidor-2 fundus images than a general-domain ViT-L.
+      - ViT-S/16 (hidden_dim=384) paired with a 64-dim conditioning bottleneck
+        keeps the conditioning path lean without losing semantic content.
+      - Loading from a local checkpoint ensures reproducibility: the weights
+        are fixed and not tied to a remote HuggingFace model version.
 
-    The final classification layer (fc) is removed — we want the
-    2048-dim feature vector before that layer, not class probabilities.
+    The checkpoint directory must contain HuggingFace-compatible files:
+        config.json
+        model.safetensors  (or pytorch_model.bin)
 
-    This is exactly what the RCDM paper does: use the ResNet-50
-    trunk/backbone output as the conditioning vector h.
+    Output: CLS token from last_hidden_state[:,0,:] — shape (B, 384).
 
     Args:
-        device : "cpu" or "cuda"
+        device          : "cpu" or "cuda"
+        checkpoint_path : path to the local DinoV3 checkpoint directory
 
     Returns:
-        encoder : frozen ResNet-50 backbone, eval mode, on device
+        encoder : frozen DinoV3-S backbone, eval mode, on device
     """
-    # Load ResNet-50 with ImageNet pretrained weights
-    encoder = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    encoder = AutoModel.from_pretrained(checkpoint_path, local_files_only=True)
 
-    # Remove the classification head — output is now (B, 2048)
-    # avgpool gives (B, 2048, 1, 1), Flatten gives (B, 2048)
-    encoder.fc = nn.Identity()
-
-    # Freeze all weights — we never train the encoder
     for param in encoder.parameters():
         param.requires_grad = False
 
@@ -42,17 +52,17 @@ def load_encoder(device="cpu"):
     return encoder
 
 
-# Standard ImageNet normalisation — must match what ResNet-50 was trained with
+# DinoV3 uses standard ImageNet normalisation (same as DinoV2)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 
-def build_transform(image_size=64):
+def build_transform(image_size=224):
     """
-    Preprocessing pipeline for any input image before encoding.
+    Preprocessing pipeline for DinoV3 ViT-S/16.
 
-    Resize → CenterCrop → Tensor → Normalize.
-    image_size should match what RCDM was trained on (64 for Tiny ImageNet).
+    ViT-S/16 has patch_size=16; any input size divisible by 16 works.
+    224×224 is the canonical choice and aligns with the JiT patch grid.
     """
     return transforms.Compose([
         transforms.Resize(image_size),
@@ -65,24 +75,21 @@ def build_transform(image_size=64):
 @torch.no_grad()
 def encode_image(image_path, encoder, transform, device="cpu"):
     """
-    Extract the 2048-dim backbone representation from a single image file.
-
-    This is the h vector that gets passed to RCDM as conditioning.
-    Works on ANY image — in-distribution (Tiny ImageNet) or completely
-    out-of-distribution (your own photos).
+    Extract the 384-dim CLS token from a single image via DinoV3.
 
     Args:
         image_path : path to image file (jpg, png, anything PIL can open)
-        encoder    : the frozen ResNet-50 from load_encoder()
-        transform  : the preprocessing pipeline from build_transform()
+        encoder    : frozen DinoV3-S from load_encoder()
+        transform  : preprocessing pipeline from build_transform()
         device     : must match encoder's device
 
     Returns:
-        h : torch.Tensor of shape (1, 2048)
+        h : torch.Tensor of shape (1, 384)
     """
-    img = Image.open(image_path).convert("RGB")  # convert handles grayscale/RGBA
-    x = transform(img).unsqueeze(0).to(device)   # (1, 3, H, W)
-    h = encoder(x)                               # (1, 2048)
+    img = Image.open(image_path).convert("RGB")
+    x = transform(img).unsqueeze(0).to(device)        # (1, 3, H, W)
+    out = encoder(pixel_values=x)
+    h = out.last_hidden_state[:, 0, :]                # CLS token → (1, 384)
     return h
 
 
@@ -91,38 +98,36 @@ def encode_batch(image_paths, encoder, transform, device="cpu", batch_size=64):
     """
     Extract representations for a list of image paths efficiently.
 
-    Used by precompute_reps.py to cache all training representations
-    before training starts — so we don't re-run the encoder every step.
+    Used by precompute_reps.py to cache all training representations before
+    training starts — so we do not re-run the encoder every step.
 
     Args:
         image_paths : list of file paths
-        encoder     : frozen ResNet-50 from load_encoder()
+        encoder     : frozen DinoV3-S from load_encoder()
         transform   : from build_transform()
         device      : must match encoder's device
         batch_size  : how many images to process at once
 
     Returns:
-        reps : torch.Tensor of shape (N, 2048)
+        reps : torch.Tensor of shape (N, 384)
     """
     all_reps = []
 
     for i in range(0, len(image_paths), batch_size):
         batch_paths = image_paths[i : i + batch_size]
 
-        # Load and preprocess each image in the batch
         imgs = []
         for p in batch_paths:
             img = Image.open(p).convert("RGB")
             imgs.append(transform(img))
 
-        # Stack into a single tensor (B, 3, H, W)
-        x = torch.stack(imgs).to(device)
+        x = torch.stack(imgs).to(device)              # (B, 3, H, W)
 
-        # Run through encoder
-        h = encoder(x)   # (B, 2048)
+        out = encoder(pixel_values=x)
+        h = out.last_hidden_state[:, 0, :]            # CLS token → (B, 384)
         all_reps.append(h.cpu())
 
         if i % (batch_size * 10) == 0:
             print(f"  encoded {i}/{len(image_paths)} images")
 
-    return torch.cat(all_reps, dim=0)   # (N, 2048)
+    return torch.cat(all_reps, dim=0)                 # (N, 384)
